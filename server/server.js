@@ -7,6 +7,8 @@ import path from "path";
 import mammoth from "mammoth";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import JSZip from "jszip";
+import { XMLParser } from "fast-xml-parser";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
@@ -42,6 +44,55 @@ function buildPdfParseOptions() {
   return { pagerender, max: 25 * 1024 * 1024, version: "default" };
 }
 
+/** Extract text from .pptx by reading slide XML and collecting <a:t> runs */
+async function extractTextFromPptx(filePath) {
+  const buf = await fs.readFile(filePath);
+  const zip = await JSZip.loadAsync(buf);
+  const slideFiles = Object.keys(zip.files)
+    .filter((p) => p.startsWith("ppt/slides/slide") && p.endsWith(".xml"))
+    .sort((a, b) => {
+      // keep slide order (slide1.xml, slide2.xml, ...)
+      const na = parseInt(a.match(/slide(\d+)\.xml$/)?.[1] || "0", 10);
+      const nb = parseInt(b.match(/slide(\d+)\.xml$/)?.[1] || "0", 10);
+      return na - nb;
+    });
+
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    preserveOrder: false,
+  });
+
+  const parts = [];
+
+  function collectAText(node) {
+    if (node == null) return;
+    if (Array.isArray(node)) {
+      for (const item of node) collectAText(item);
+      return;
+    }
+    if (typeof node === "object") {
+      for (const [k, v] of Object.entries(node)) {
+        // PowerPoint text runs are typically in `a:t` (namespaced)
+        if (k.endsWith(":t") && typeof v === "string") {
+          parts.push(v);
+        } else {
+          collectAText(v);
+        }
+      }
+    }
+  }
+
+  for (const p of slideFiles) {
+    const xml = await zip.files[p].async("string");
+    const json = parser.parse(xml);
+    collectAText(json);
+    parts.push("\n"); // separate slides
+  }
+
+  return parts.join(" ").replace(/\s*\n\s*/g, "\n").trim();
+}
+
+/** --- Extract text from file (PDF, DOCX, TXT, PPTX). Handles octet-stream by extension. --- */
 async function extractText(filePath, mimetype, originalname) {
   const ext = getExtSafe(originalname);
   const isPDF =
@@ -52,6 +103,10 @@ async function extractText(filePath, mimetype, originalname) {
     mimetype ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
     ext === ".docx";
+  const isPPTX =
+    mimetype ===
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation" ||
+    ext === ".pptx";
   const isTXT = mimetype?.startsWith("text/") || ext === ".txt";
 
   if (isPDF) {
@@ -63,8 +118,15 @@ async function extractText(filePath, mimetype, originalname) {
     const res = await mammoth.extractRawText({ path: filePath });
     return (res.value || "").trim();
   }
-  if (isTXT) return (await fs.readFile(filePath, "utf8")).trim();
-  throw new Error("Unsupported file type. Please upload PDF, DOCX, or TXT.");
+  if (isPPTX) {
+    const txt = await extractTextFromPptx(filePath);
+    return (txt || "").trim();
+  }
+  if (isTXT) {
+    return (await fs.readFile(filePath, "utf8")).trim();
+  }
+
+  throw new Error("Unsupported file type. Please upload PDF, DOCX, PPTX, or TXT.");
 }
 
 /* ---------- main route ---------- */
@@ -87,10 +149,10 @@ app.post("/api/generate-quiz", upload.single("file"), async (req, res) => {
     if (!text || text.length < 50)
       return res.status(422).json({
         error:
-          "Text extraction failed (likely image-only PDF). Convert to searchable PDF and retry.",
+          "Text extraction failed (document has too little text or is image-only without OCR).",
       });
 
-    /* ---------- schema: root object with quiz array ---------- */
+    // --- JSON Schema (root object with quiz array) ---
     const schema = {
       type: "object",
       additionalProperties: false,
@@ -100,7 +162,7 @@ app.post("/api/generate-quiz", upload.single("file"), async (req, res) => {
           type: "array",
           items: {
             type: "object",
-            additionalProperties: false,     // <-- required by the API
+            additionalProperties: false,
             required: ["question", "options", "answer", "difficulty"],
             properties: {
               question: { type: "string" },
@@ -108,14 +170,17 @@ app.post("/api/generate-quiz", upload.single("file"), async (req, res) => {
                 type: "array",
                 items: { type: "string" },
                 minItems: 4,
-                maxItems: 4
+                maxItems: 4,
               },
               answer: { type: "string" },
-              difficulty: { type: "string", enum: ["easy", "medium", "hard"] }
-            }
-          }
-        }
-      }
+              difficulty: {
+                type: "string",
+                enum: ["easy", "medium", "hard"],
+              },
+            },
+          },
+        },
+      },
     };
 
     const prompt = `
@@ -125,12 +190,11 @@ Each question has 4 options, one correct answer, and a difficulty tag ("easy", "
 User selected difficulty mode: "${difficulty}".
 - If "mixed": distribute evenly across all 3 levels.
 - If "easy" | "medium" | "hard": make all questions that level.
-Return JSON in this exact shape: { "quiz": [ { "question": "...", "options": [...], "answer": "...", "difficulty": "..." } ] }
+Return JSON in this exact shape: { "quiz": [ { "question": "...", "options": ["A","B","C","D"], "answer": "A", "difficulty": "easy|medium|hard" } ] }
 
 Text:
 """${text.slice(0, 40000)}"""`;
 
-    /* ---------- call Responses API with new syntax ---------- */
     const completion = await openai.responses.create({
       model: "gpt-4o-mini",
       input: prompt,
@@ -138,12 +202,11 @@ Text:
         format: {
           type: "json_schema",
           name: "mcq_list",
-          schema, // correct field name
+          schema,
         },
       },
     });
 
-    /* ---------- parse output ---------- */
     const outText =
       completion.output?.[0]?.content?.[0]?.text ??
       completion.output_text ??
